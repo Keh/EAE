@@ -1,0 +1,833 @@
+from __future__ import print_function
+from matplotlib import pyplot as plt
+import matplotlib
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from scipy import stats
+
+from sklearn import preprocessing
+from sklearn.metrics import mean_squared_error
+
+import keras
+from keras.models import Sequential, Model, load_model
+from keras.layers import Dense, Input, Dropout
+from keras.utils import np_utils
+from keras.callbacks import ModelCheckpoint
+from keras.layers.normalization import BatchNormalization
+
+
+import random
+
+from resource import *
+import time
+
+class Dataset:
+
+    def __init__(self, file_path):
+        self.file_path = file_path
+
+    def read_data(self):
+        column_names = ['user-id',  # 1
+                        'activity', # 2
+                        'timestamp',# 3
+                        'x-axis',   # 4
+                        'y-axis',   # 5
+                        'z-axis']   # 6
+        df = pd.read_csv(self.file_path,
+                         header=None,
+                         names=column_names)
+        # Last column has a ";" character which must be removed ...
+        df['z-axis'].replace(regex=True,
+                             inplace=True,
+                             to_replace=r';',
+                             value=r'')
+        # ... and then this column must be transformed to float explicitly
+        df['z-axis'] = df['z-axis'].apply(self.convert_to_float)
+        # This is very important otherwise the model will not fit and loss
+        # will show up as NAN
+        df.dropna(axis=0, how='any', inplace=True)
+        return df
+
+    def read_data_Pamap2(self):
+        column_names = ['activity',
+                        'user-id',
+                        'x-acc-hand',
+                        'y-acc-hand',
+                        'z-acc-hand',
+                        'x-gyr-hand',
+                        'y-gyr-hand',
+                        'z-gyr-hand',
+                        'x-mag-hand',
+                        'y-mag-hand',
+                        'z-mag-hand',
+                        'temp-chest',
+                        'x-acc-chest',
+                        'y-acc-chest',
+                        'z-acc-chest',
+                        'x-gyr-chest',
+                        'y-gyr-chest',
+                        'z-gyr-chest',
+                        'x-mag-chest',
+                        'y-mag-chest',
+                        'z-mag-chest',
+                        'temp-ankle',
+                        'x-acc-ankle',
+                        'y-acc-ankle',
+                        'z-acc-ankle',
+                        'x-gyr-ankle',
+                        'y-gyr-ankle',
+                        'z-gyr-ankle',
+                        'x-mag-ankle',
+                        'y-mag-ankle',
+                        'z-mag-ankle']
+        df = pd.read_csv(self.file_path,
+                         header=None,
+                         names=column_names, skiprows=1)
+
+        return df
+
+    def read_data_mhealth(self):
+        column_names = ['user-id',
+                        'activity',
+                        'x-acc-chest',
+                        'y-acc-chest',
+                        'z-acc-chest',
+                        'x-acc-ankle',
+                        'y-acc-ankle',
+                        'z-acc-ankle',
+                        'x-gyr-ankle',
+                        'y-gyr-ankle',
+                        'z-gyr-ankle',
+                        'x-mag-ankle',
+                        'y-mag-ankle',
+                        'z-mag-ankle',
+                        'x-acc-arm',
+                        'y-acc-arm',
+                        'z-acc-arm',
+                        'x-gyr-arm',
+                        'y-gyr-arm',
+                        'z-gyr-arm',
+                        'x-mag-arm',
+                        'y-mag-arm',
+                        'z-mag-arm'
+                        ]
+        df = pd.read_csv(self.file_path,
+                         header=None,
+                         names=column_names, skiprows=1)
+
+        df.dropna(axis=0, how='any', inplace=True)
+        return df
+
+    def convert_to_float(self, x):
+        try:
+            return np.float(x)
+        except:
+            return np.nan
+
+    def show_basic_dataframe_info(self, dataframe):
+        # Shape and how many rows and columns
+        print('Number of columns in the dataframe: %i' % (dataframe.shape[1]))
+        print('Number of rows in the dataframe: %i\n' % (dataframe.shape[0]))
+
+    def plot_activity(self, activity, data):
+
+        fig, (ax0, ax1, ax2) = plt.subplots(nrows=3,
+                                            figsize=(15, 10),
+                                            sharex=True)
+        self.plot_axis(ax0, data['timestamp'], data['x-axis'], 'X-Axis')
+        self.plot_axis(ax1, data['timestamp'], data['y-axis'], 'Y-Axis')
+        self.plot_axis(ax2, data['timestamp'], data['z-axis'], 'Z-Axis')
+        plt.subplots_adjust(hspace=0.2)
+        fig.suptitle(activity)
+        plt.subplots_adjust(top=0.90)
+        plt.show()
+
+    def plot_axis(self, ax, x, y, title):
+
+        ax.plot(x, y, 'r')
+        ax.set_title(title)
+        ax.xaxis.set_visible(False)
+        ax.set_ylim([min(y) - np.std(y), max(y) + np.std(y)])
+        ax.set_xlim([min(x), max(x)])
+        ax.grid(True)
+
+    """for activity in np.unique(df['activity']):
+        subset = df[df['activity'] == activity][:180]
+        plot_activity(activity, subset)"""
+
+    def create_segments_and_labels(self, df, time_steps, step, label_name):
+
+        # x, y, z acceleration as features
+        N_FEATURES = 3
+        # Number of steps to advance in each iteration (for me, it should always
+        # be equal to the time_steps in order to have no overlap between segments)
+        step = time_steps
+        segments = []
+        labels = []
+        id_user = []
+        if step != 0:
+            print("WARNING!!!!! OVERLAP ON\n")
+            for i in range(0, len(df) - time_steps, step):
+                xs = df['x-axis'].values[i: i + time_steps]
+                ys = df['y-axis'].values[i: i + time_steps]
+                zs = df['z-axis'].values[i: i + time_steps]
+                # Retrieve the most often used label in this segment
+                label = stats.mode(df[label_name][i: i + time_steps])
+                user = stats.mode(df['user-id'][i: i + time_steps])
+                if(len(df[label_name][i: i + time_steps]) == label[1][0] ) :
+                    segments.append([xs, ys, zs])
+                    labels.append(label[0][0])
+                    id_user.append(user[0][0])
+
+        if step == 0:
+            for i in range(0, len(df) - time_steps):
+                xs = df['x-axis'].values[i: i + time_steps]
+                ys = df['y-axis'].values[i: i + time_steps]
+                zs = df['z-axis'].values[i: i + time_steps]
+                # Retrieve the most often used label in this segment
+                label = stats.mode(df[label_name][i: i + time_steps])
+                user = stats.mode(df['user-id'][i: i + time_steps])
+                if(len(df[label_name][i: i + time_steps]) == label[1][0] ) :
+                    segments.append([xs, ys, zs])
+                    labels.append(label[0][0])
+                    id_user.append(user[0][0])
+
+        # Bring the segments into a better shape
+        reshaped_segments = np.asarray(segments, dtype=np.float32).reshape(-1, time_steps, N_FEATURES)
+        labels = np.asarray(labels)
+        id_user = np.asarray(id_user)
+
+        return reshaped_segments, labels, id_user
+
+    def segments_Pamap2(self, df, time_steps, step, label_name):
+
+        # x, y, z acceleration as features
+        N_FEATURES = 3
+        # Number of steps to advance in each iteration (for me, it should always
+        # be equal to the time_steps in order to have no overlap between segments)
+        step = time_steps
+        segments = []
+        labels = []
+        id_user = []
+        if step != 0:
+            print("WARNING!!!!! OVERLAP ON\n")
+            for i in range(0, len(df) - time_steps, step):
+                x_acc_hand = df['x-acc-hand'].values[i: i + time_steps]
+                y_acc_hand = df['y-acc-hand'].values[i: i + time_steps]
+                z_acc_hand = df['z-acc-hand'].values[i: i + time_steps]
+                x_gyr_hand = df['x-gyr-hand'].values[i: i + time_steps]
+                y_gyr_hand = df['y-gyr-hand'].values[i: i + time_steps]
+                z_gyr_hand = df['z-gyr-hand'].values[i: i + time_steps]
+                x_mag_hand = df['x-mag-hand'].values[i: i + time_steps]
+                y_mag_hand = df['y-mag-hand'].values[i: i + time_steps]
+                z_mag_hand = df['z-mag-hand'].values[i: i + time_steps]
+                # Retrieve the most often used label in this segment
+                label = stats.mode(df[label_name][i: i + time_steps])
+                user = stats.mode(df['user-id'][i: i + time_steps])
+                if (len(df[label_name][i: i + time_steps]) == label[1][0]):
+                    #segments.append([x_acc_hand, y_acc_hand, z_acc_hand, x_gyr_hand, y_gyr_hand, z_gyr_hand, x_mag_hand, y_mag_hand,z_mag_hand])
+                    segments.append([x_acc_hand, y_acc_hand, z_acc_hand])
+                    labels.append(label[0][0])
+                    id_user.append(user[0][0])
+
+        if step == 0:
+            for i in range(0, len(df) - time_steps):
+                x_acc_hand = df['x-acc-hand'].values[i: i + time_steps]
+                y_acc_hand = df['y-acc-hand'].values[i: i + time_steps]
+                z_acc_hand = df['z-acc-hand'].values[i: i + time_steps]
+                #x_gyr_hand = df['x-gyr-hand'].values[i: i + time_steps]
+                #y_gyr_hand = df['y-gyr-hand'].values[i: i + time_steps]
+                #z_gyr_hand = df['z-gyr-hand'].values[i: i + time_steps]
+                #x_mag_hand = df['x-mag-hand'].values[i: i + time_steps]
+                #y_mag_hand = df['y-mag-hand'].values[i: i + time_steps]
+                #z_mag_hand = df['z-mag-hand'].values[i: i + time_steps]
+                x_acc_chest = df['x-acc-chest'].values[i: i + time_steps]
+                y_acc_chest = df['y-acc-chest'].values[i: i + time_steps]
+                z_acc_chest = df['z-acc-chest'].values[i: i + time_steps]
+                #
+                x_acc_ankle = df['x-acc-ankle'].values[i: i + time_steps]
+                y_acc_ankle = df['y-acc-ankle'].values[i: i + time_steps]
+                z_acc_ankle = df['z-acc-ankle'].values[i: i + time_steps]
+                # Retrieve the most often used label in this segment
+                label = stats.mode(df[label_name][i: i + time_steps])
+                user = stats.mode(df['user-id'][i: i + time_steps])
+                if (len(df[label_name][i: i + time_steps]) == label[1][0]):
+                    #segments.append([x_acc_hand, y_acc_hand, z_acc_hand, x_acc_chest, y_acc_chest, z_acc_chest, x_acc_ankle, y_acc_ankle, z_acc_ankle])
+                    segments.append([x_acc_hand, y_acc_hand, z_acc_hand])
+                    labels.append(label[0][0])
+                    id_user.append(user[0][0])
+
+        # Bring the segments into a better shape
+        reshaped_segments = np.asarray(segments, dtype=np.float32).reshape(-1, time_steps, N_FEATURES)
+        labels = np.asarray(labels)
+        id_user = np.asarray(id_user)
+
+        return reshaped_segments, labels, id_user
+
+    def segments_mHealth(self, df, time_steps, step, label_name):
+
+        # x, y, z acceleration as features
+        N_FEATURES = 3
+        #N_FEATURES = 9
+        step = time_steps
+        segments = []
+        labels = []
+        id_user = []
+
+        for i in range(0, len(df) - time_steps, step):
+            x_acc_chest = df['x-acc-chest'].values[i: i + time_steps]
+            y_acc_chest = df['y-acc-chest'].values[i: i + time_steps]
+            z_acc_chest = df['z-acc-chest'].values[i: i + time_steps]
+            x_acc_ankle = df['x-acc-ankle'].values[i: i + time_steps]
+            y_acc_ankle = df['y-acc-ankle'].values[i: i + time_steps]
+            z_acc_ankle = df['z-acc-ankle'].values[i: i + time_steps]
+            x_acc_arm = df['x-acc-arm'].values[i: i + time_steps]
+            y_acc_arm = df['y-acc-arm'].values[i: i + time_steps]
+            z_acc_arm = df['z-acc-arm'].values[i: i + time_steps]
+
+            # Retrieve the most often used label in this segment
+            label = stats.mode(df[label_name][i: i + time_steps])
+            user = stats.mode(df['user-id'][i: i + time_steps])
+            if (len(df[label_name][i: i + time_steps]) == label[1][0]):
+                #segments.append([x_acc_hand, y_acc_hand, z_acc_hand, x_gyr_hand, y_gyr_hand, z_gyr_hand, x_mag_hand, y_mag_hand, z_mag_hand])
+                #segments.append([x_acc_chest, y_acc_chest, z_acc_chest, x_acc_ankle, y_acc_ankle, z_acc_ankle, x_acc_arm, y_acc_arm, z_acc_arm])
+                segments.append([x_acc_arm, y_acc_arm, z_acc_arm])
+                labels.append(label[0][0])
+                id_user.append(user[0][0])
+
+                # Bring the segments into a better shape
+        reshaped_segments = np.asarray(segments, dtype=np.float32).reshape(-1, time_steps, N_FEATURES)
+        labels = np.asarray(labels)
+        id_user = np.asarray(id_user)
+
+        return reshaped_segments, labels, id_user
+
+# creating autoencoder model
+# OFFLINE TRAIN
+class SingleAED:
+
+    def __init__(self, train, test):
+        self.x_train = train
+        self.x_test = test
+        self.input_dim = train.shape[1]
+
+    def setSingleModel(self):
+        # dimensionality reduction
+        encoding_dim = 32 # 32
+        compression_factor = float(self.input_dim/encoding_dim)
+
+        autoencoder = Sequential()
+        # one layer to 784 -> 32
+        # encoder
+        autoencoder.add(Dense(200, input_shape=(self.input_dim,), activation='relu'))  # relu -> linear is faster
+        autoencoder.add(Dense(100, input_shape=(self.input_dim,), activation='relu'))  # relu -> linear is faster
+        autoencoder.add(Dense(80, input_shape=(self.input_dim,), activation='linear'))  # relu -> linear is faster
+        autoencoder.add(Dense(encoding_dim, input_shape=(self.input_dim,), activation='linear'))  # relu -> linear is faster
+        # sigmoid is the activation function
+        #decoder
+        autoencoder.add(Dense(80, activation='linear'))  # tanh
+        autoencoder.add(Dense(100, activation='relu'))  # tanh
+        autoencoder.add(Dense(200, activation='relu'))  # tanh
+        autoencoder.add(Dense(self.input_dim, activation='linear'))  # tanh
+
+        # covert to keras tensors
+        autoencoder.compile(optimizer='adam', loss='mae', metrics=['mean_squared_error'])
+
+        filepath = "weights.best.hdf5"
+        checkpoint = ModelCheckpoint(filepath, monitor='loss', verbose=1, save_best_only=True, mode='max')
+        callbacks_list = [checkpoint]
+
+        batch = np.int(len(self.x_train) / 7)
+        print(str(batch))
+        #autoencoder.fit(self.x_train, self.x_train, epochs=250, batch_size=batch, shuffle=True, callbacks=callbacks_list)
+        autoencoder.fit(self.x_train, self.x_train, epochs=250, batch_size=256, shuffle=True,callbacks=callbacks_list)
+
+        return autoencoder
+
+
+# Set some standard parameters upfront
+pd.options.display.float_format = '{:.1f}'.format
+sns.set() # Default seaborn look and feel
+plt.style.use('ggplot')
+print('keras version ', keras.__version__)
+
+f = open("/home/kemilly/NEUROCOMPUTING/Results/EAE/results_mhealth_5.txt", "a")
+f.write("EAE")
+f.write("\n")
+start = time.time()
+
+#isnotpamap = 0
+#dt = Dataset('/home/kemilly/NEUROCOMPUTING/neurocomputing/HAR/Datasets/WISDM_ar_latest/WISDM_ar_v1.1/WISDM_ar_v1.1_raw.txt')
+# Load data set containing all the data from csv
+#df = dt.read_data()
+
+#dt = Dataset('/home/kemilly/NEUROCOMPUTING/neurocomputing/HAR/Datasets/pamap2.txt')
+#df = dt.read_data_Pamap2()
+#isnotpamap = 1
+
+#dt = Dataset('/home/kemilly/HAR/Datasets/mhealth_AE.txt')
+dt = Dataset('/home/kemilly/NEUROCOMPUTING/neurocomputing/HAR/Datasets/mhealth_AE_remove_0.txt')
+df = dt.read_data_mhealth()
+isnotpamap = 2
+
+
+# The number of steps within one time segment
+# window size
+seconds = 5
+if isnotpamap == 0:
+    TIME_PERIODS = seconds * 20
+if isnotpamap == 1:
+    TIME_PERIODS = seconds * 100
+if isnotpamap == 2:
+    TIME_PERIODS = seconds * 50
+
+TIME_PERIODS = 180
+
+# The steps to take from one segment to the next; if this value is equal to
+# TIME_PERIODS, then there is no overlap between the segments
+# overlap factor
+STEP_DISTANCE = 0
+LABELS = np.unique(df['activity']).tolist()
+# Describe the data
+dt.show_basic_dataframe_info(df)
+df.head(20)
+
+LABEL = 'ActivityEncoded'
+# Transform the labels from String to Integer via LabelEncoder
+le = preprocessing.LabelEncoder()
+# Add a new column to the existing DataFrame with the encoded values
+df[LABEL] = le.fit_transform(df['activity'].values.ravel())
+
+if isnotpamap == 0:
+    pd.options.mode.chained_assignment = None  # default='warn'
+
+    # Round numbers
+    df = df.round({'x-axis': 4, 'y-axis': 4, 'z-axis': 4})
+    x_data, y_data, id_data = dt.create_segments_and_labels(df,TIME_PERIODS,STEP_DISTANCE,LABEL)
+    tamanho = x_data.shape[0]
+if isnotpamap == 2:
+    pd.options.mode.chained_assignment = None  # default='warn'
+
+    # Round numbers
+    #df = df.round({'x-acc-chest': 4, 'y-acc-chest': 4, 'z-acc-chest': 4})
+    #df = df.round({'x-acc-ankle': 4, 'y-acc-ankle': 4, 'z-acc-ankle': 4})
+    #df = df.round({'x-acc-chest':4 , 'y-acc-chest':4, 'z-acc-chest': 4, 'x-acc-ankle':4, 'y-acc-ankle':4, 'z-acc-ankle':4, 'x-acc-arm':4, 'y-acc-arm': 4, 'z-acc-arm':4})
+    df = df.round({'x-acc-arm': 4, 'y-acc-arm': 4, 'z-acc-arm': 4})
+    x_data, y_data, id_data = dt.segments_mHealth(df,TIME_PERIODS, STEP_DISTANCE,LABEL)
+
+if isnotpamap == 1:
+    pd.options.mode.chained_assignment = None  # default='warn'
+
+    # Round numbers
+    #df = df.round({'x-acc-hand': 4, 'y-acc-hand': 4, 'z-acc-hand': 4, 'x-acc-chest': 4, 'y-acc-chest': 4, 'z-acc-chest': 4, 'x-acc-ankle': 4, 'y-acc-ankle': 4, 'z-acc-ankle': 4})
+    #df = df.round({'x-acc-hand': 4, 'y-acc-hand': 4, 'z-acc-hand': 4, 'x-gyr-hand': 4, 'y-gyr-hand': 4, 'z-gyr-hand': 4, 'x-mag-hand': 4, 'y-mag-hand': 4, 'z-mag-hand': 4})
+    #df = df.round({'x-acc-chest': 4, 'y-acc-chest': 4, 'z-acc-chest': 4, 'x-gyr-chest': 4, 'y-gyr-chest': 4, 'z-gyr-chest': 4, 'x-mag-chest': 4, 'y-mag-chest': 4, 'z-mag-chest': 4})
+    #df = df.round({'x-acc-ankle': 4, 'y-acc-ankle': 4, 'z-acc-ankle': 4, 'x-gyr-ankle': 4, 'y-gyr-ankle': 4, 'z-gyr-ankle': 4, 'x-mag-ankle': 4, 'y-mag-ankle': 4, 'z-mag-ankle': 4})
+    #df = df.round({'x-acc-hand': 4, 'y-acc-hand': 4, 'z-acc-hand': 4, 'x-acc-chest': 4, 'y-acc-chest': 4, 'z-acc-chest': 4, 'x-acc-ankle': 4, 'y-acc-ankle': 4, 'z-acc-ankle': 4})
+
+    # df = df.round({'x-acc-ankle': 4, 'y-acc-ankle': 4, 'z-acc-ankle': 4})
+    # df = df.round({'x-acc-chest': 4, 'y-acc-chest': 4, 'z-acc-chest': 4})
+    # hand
+    # chest
+    # ankle
+    df = df.round({'x-acc-hand': 4, 'y-acc-hand': 4, 'z-acc-hand': 4})
+    x_data, y_data, id_data = dt.segments_Pamap2(df,TIME_PERIODS,STEP_DISTANCE,LABEL)
+
+    tamanho = x_data.shape[0]
+
+    end_fetch = time.time()
+    runtime_fetch = end_fetch - start
+    msg = "The runtime for data fetch took {time} seconds to complete"
+    f.write("data_fetch," + str(runtime_fetch))
+    f.write("\n")
+    print(msg.format(time=runtime_fetch))
+
+    print('Kemilly 2019')
+
+# SAVING TIME
+for id in df['user-id'].unique()[0:1]:
+    if id != 1000:
+
+        print(" MODEL ON USER: ", id)
+
+        #id = 1
+        # Differentiate between test set and training set
+        # train
+        x_train = x_data[np.where(id_data != int(id))]
+        y_train = y_data[np.where(id_data != int(id))]
+        # test
+        x_test = x_data[np.where(id_data == int(id))]
+        y_test = y_data[np.where(id_data == int(id))]
+
+        print("FEATURES CREATED! ")
+        # Set input & output dimensions
+        num_time_periods, num_sensors = x_train.shape[1], x_train.shape[2]
+        num_classes = le.classes_.size
+        print(list(le.classes_))
+
+        input_shape = (num_time_periods*num_sensors)
+        X = x_train.shape[0]
+        x_train = x_train.reshape(x_train.shape[0], input_shape)
+        x_test = x_test.reshape(x_test.shape[0], input_shape)
+        print('x_train shape:', x_train.shape)
+        print('input_shape:', input_shape)
+
+        # for keras
+        x_train = x_train.astype('float32')
+        y_train = y_train.astype('float32')
+        #
+        x_test = x_test.astype('float32')
+        y_test = y_test.astype('float32')
+
+        # one-hot-encoding of our labels - para que?
+        y_train_hot = np_utils.to_categorical(y_train, num_classes)
+        print('New y_train shape: ', y_train_hot.shape)
+
+        # calculate score -> loss function
+        def LosScore(x_pred, test):
+            X_pred = x_pred
+            scored = np.mean(np.abs(pd.DataFrame(X_pred)) - np.abs(pd.DataFrame(test)), axis=1)
+            return scored
+
+        def LosScore2(x_pred, x_test):
+            mse = []
+            for i in range(len(x_test)):
+                mse.append(mean_squared_error(pd.DataFrame(x_pred[i]), pd.DataFrame(x_test[i])))
+            return mse
+
+        # calculate accuracy
+        def cal_accuracy(guess, yTest):
+            #yTest = yTest.to_list()
+            yTest = [int(i) for i in yTest]
+            guess = [int(i) for i in guess]
+
+            if(len(guess) == len(yTest)):
+                iquals = sum(1 if x == y else 0 for x, y in zip(guess, yTest))
+                #iquals = sum(i for i, j in zip(guess, yTest) if i == j)/len(yTest)
+                print(iquals)
+                print(yTest)
+                acc = iquals/len(yTest)
+                #acc = iquals
+            else:
+                acc = 0
+                print("ERRO - guess list not the same size as yTest")
+            return acc
+
+        start_train = time.time()
+        print("START TRAINING ")
+        # train Offline
+        ensemble = []
+        global decoded_img
+        for i in range(len(LABELS)):
+            print(LABELS[i])
+            sub_train = x_train[y_train == i]
+            sub_test = x_test[y_test == i]
+
+            autoencoder = SingleAED(sub_train, sub_test)
+            autoencoder = autoencoder.setSingleModel()
+            ensemble.append(autoencoder)
+
+            # for clustering in future
+            # encoded_img = encoder.predict(x_test)
+            # decoded_img = autoencoder.predict(sub_test)
+
+        # time to train
+        end_train = time.time()
+        runtime_train = end_train - start_train
+        msg = "The runtime for training the model took {time} seconds to complete"
+        print(msg.format(time=runtime_train))
+        f.write("training," + str(runtime_train) + ",user," + str(i))
+        f.write("\n")
+
+        # save models
+        import os, shutil
+        dirname = "/home/kemilly/EAE/pamap2/model_" + str(id)+"/"
+        #print("SAVE ENSEMBLE IN FILE ", dirname)
+        # delete
+        if os.path.isdir(dirname):
+            shutil.rmtree(dirname)
+            os.mkdir(dirname)
+        # create
+        else:
+            os.mkdir(dirname)
+        """for e in range(len(ensemble)):
+            save_file = dirname + "Model_" + str(e) + ".h5"
+            ensemble[e].save(save_file)
+            print("MODEL ", e, " SAVED!")"""
+
+        print("TESTING -> NOT ONLINE")
+        x_pred = []
+        scored = []
+        # for each ensemble
+        # predition
+        start_test = time.time()
+        for e in range(len(ensemble)):
+            x_pred.append(ensemble[e].predict(x_test))
+
+        scored0 = (LosScore2(x_pred[0], x_test))
+        scored1 = (LosScore2(x_pred[1], x_test))
+        scored2 = (LosScore2(x_pred[2], x_test))
+        scored3 = (LosScore2(x_pred[3], x_test))
+        scored4 = (LosScore2(x_pred[4], x_test))
+        scored5 = (LosScore2(x_pred[5], x_test))
+        #for pamap
+
+        if isnotpamap == 1:
+            scored6 = (LosScore2(x_pred[6], x_test))
+            scored7 = (LosScore2(x_pred[7], x_test))
+            scored8 = (LosScore2(x_pred[8], x_test))
+            scored9 = (LosScore2(x_pred[9], x_test))
+            scored10 = (LosScore2(x_pred[10], x_test))
+            scored11 = (LosScore2(x_pred[11], x_test))
+            zippedList = list(
+                zip(scored0, scored1, scored2, scored3, scored4, scored5, scored6, scored7, scored8, scored9, scored10,
+                    scored11))
+        if isnotpamap == 0:
+            zippedList = list(zip(scored0, scored1, scored2, scored3, scored4, scored5))
+        if isnotpamap == 2:
+            scored6 = (LosScore2(x_pred[6], x_test))
+            scored7 = (LosScore2(x_pred[7], x_test))
+            scored8 = (LosScore2(x_pred[8], x_test))
+            scored9 = (LosScore2(x_pred[9], x_test))
+            scored10 = (LosScore2(x_pred[10], x_test))
+            scored11 = (LosScore2(x_pred[11], x_test))
+            #scored12 = (LosScore2(x_pred[12], x_test))
+            #zippedList = list(zip(scored0, scored1, scored2, scored3, scored4, scored5, scored6, scored7, scored8, scored9, scored10,scored11, scored12))
+            zippedList = list(zip(scored0, scored1, scored2, scored3, scored4, scored5, scored6, scored7, scored8, scored9, scored10, scored11))
+
+        dfObj = pd.DataFrame(zippedList)
+        min = dfObj.idxmin(axis=1)
+
+        end_test = time.time()
+        runtime_test = end_test - start_test
+        msg = "The runtime for predition took {time} seconds to complete"
+        print(msg.format(time=runtime_test))
+        f.write("testingOff," + str(runtime_test) + ",user," + str(i))
+        f.write("\n")
+
+        from sklearn.metrics import f1_score, recall_score
+
+        acc = cal_accuracy(y_test, min)
+        y_true = [int(i) for i in y_test]
+        y_pred = [int(i) for i in min]
+        f1 = f1_score(y_true, y_pred, average='weighted')
+        recall = recall_score(y_true, y_pred, average='weighted')
+        print(acc)
+        print(f1)
+        print(recall)
+
+        f.write("User_Off," + str(id) + ",Accuracy," + str(acc))
+        f.write("\n")
+        f.write("User_Off," + str(id) + ",Recall," + str(recall))
+        f.write("\n")
+        f.write("User_Off," + str(id) + ",F1," + str(f1))
+        f.write("\n")
+
+
+        # online
+        x_pred = []
+        scored = []
+        min = []
+        max = []
+        threshold = 0.1
+        # predition
+        start_test = time.time()
+        for x in range(0, len(x_test)):
+            # for x in range(0, 1):
+            # for each ensemble
+            for e in range(len(ensemble)):
+                x_pred.append(ensemble[e].predict(x_test[x:(x + 1)]))
+
+            for e in range(len(x_pred)):
+                scored.append(LosScore2(x_pred[e], x_test[x:(x + 1)])[0])
+
+            # multilabel
+            multi_label = list(x for x in scored if x < 0.09)
+            # just one value
+            min.append(np.argmin(scored))
+
+            if (np.int(min[-1]) == np.int(y_test[x])):
+                keras.backend.set_value(ensemble[min[-1]].optimizer.lr, 0.0001)
+                ensemble[np.int(min[-1])].train_on_batch(x_test[x:(x + 1)], x_test[x:(x + 1)])
+                print("!!!!!!!")
+            print(x, " of ", len(x_test))
+            # discard values in the array
+            x_pred = []
+            scored = []
+
+        print("TESTING -> ONLINE")
+        x_pred = []
+        # for each ensemble
+        for e in range(len(ensemble)):
+            x_pred.append(ensemble[e].predict(x_test))
+
+        scored0 = (LosScore2(x_pred[0], x_test))
+        scored1 = (LosScore2(x_pred[1], x_test))
+        scored2 = (LosScore2(x_pred[2], x_test))
+        scored3 = (LosScore2(x_pred[3], x_test))
+        scored4 = (LosScore2(x_pred[4], x_test))
+        scored5 = (LosScore2(x_pred[5], x_test))
+        # for pamap
+        if isnotpamap == 1:
+            scored6 = (LosScore2(x_pred[6], x_test))
+            scored7 = (LosScore2(x_pred[7], x_test))
+            scored8 = (LosScore2(x_pred[8], x_test))
+            scored9 = (LosScore2(x_pred[9], x_test))
+            scored10 = (LosScore2(x_pred[10], x_test))
+            scored11 = (LosScore2(x_pred[11], x_test))
+            zippedList = list(zip(scored0, scored1, scored2, scored3, scored4, scored5, scored6, scored7, scored8, scored9, scored10, scored11))
+        if isnotpamap == 0:
+            zippedList = list(zip(scored0, scored1, scored2, scored3, scored4, scored5))
+        if isnotpamap == 2:
+            scored6 = (LosScore2(x_pred[6], x_test))
+            scored7 = (LosScore2(x_pred[7], x_test))
+            scored8 = (LosScore2(x_pred[8], x_test))
+            scored9 = (LosScore2(x_pred[9], x_test))
+            scored10 = (LosScore2(x_pred[10], x_test))
+            scored11 = (LosScore2(x_pred[11], x_test))
+            #scored12 = (LosScore2(x_pred[12], x_test))
+            #zippedList = list(zip(scored0, scored1, scored2, scored3, scored4, scored5, scored6, scored7, scored8, scored9, scored10,scored11, scored12))
+            zippedList = list(
+                zip(scored0, scored1, scored2, scored3, scored4, scored5, scored6, scored7, scored8, scored9, scored10,
+                    scored11))
+
+        dfObj = pd.DataFrame(zippedList)
+        min = dfObj.idxmin(axis=1)
+        end_test = time.time()
+        runtime_test = end_test - start_test
+        msg = "The runtime for predition took {time} seconds to complete"
+        print(msg.format(time=runtime_test))
+        f.write("testingOnl," + str(runtime_test) + ",user," + str(i))
+        f.write("\n")
+        acc_after = cal_accuracy(y_test, min)
+        y_true = [int(i) for i in y_test]
+        y_pred = [int(i) for i in min]
+        f1_after = f1_score(y_true, y_pred, average='weighted')
+        recall_after = recall_score(y_true, y_pred, average='weighted')
+        print(acc_after)
+        print(f1_after)
+        print(recall_after)
+
+        y_test = y_test.astype(int)
+        y_test = pd.Series(y_test)
+        min = min.astype(int)
+        min = pd.Series(min)
+
+        # save others results
+        dfObj.to_csv(dirname + "dfObj.csv")
+        min.to_csv(dirname + "predicted_label.csv")
+        y_test.to_csv(dirname + "real_label.csv")
+        f2 = open(dirname+"accuracy.txt", "w+")
+        f2.write("Accuracy_offline, " + str(acc))
+        f2.write("\n")
+        f2.write("Accuracy_online: " + str(acc_after))
+
+        f.write("User_Onl," + str(id) + ",Accuracy," + str(acc_after))
+        f.write("\n")
+        f.write("User_Onl," + str(id) + ",Recall," + str(recall_after))
+        f.write("\n")
+        f.write("User_Onl," + str(id) + ",F!," + str(f1_after))
+        f.write("\n")
+
+
+
+
+        # save images
+        """plt.hist(y_train)
+        plt.hist(y_test)
+        plt.savefig(dirname + "hist_train_test.png")
+
+        plt.clf()
+        for ima in range(0, 10):
+            rand = random.randint(0, len(y_test)-1)
+            plt.figure(1)
+            plt.subplot(321)
+            i = ensemble[0].predict(x_test)
+            plt.plot(x_test[rand])
+            plt.plot(i[rand])
+            # scored = LosScore(i[0], x_test[0])
+            plt.subplot(322)
+            i = ensemble[1].predict(x_test)
+            plt.plot(x_test[rand])
+            plt.plot(i[rand])
+            plt.subplot(323)
+            i = ensemble[2].predict(x_test)
+            plt.plot(x_test[rand])
+            plt.plot(i[rand])
+            plt.subplot(324)
+            i = ensemble[3].predict(x_test)
+            plt.plot(x_test[rand])
+            plt.plot(i[rand])
+            plt.subplot(325)
+            i = ensemble[4].predict(x_test)
+            plt.plot(x_test[rand])
+            plt.plot(i[rand])
+            plt.subplot(326)
+            i = ensemble[5].predict(x_test)
+            plt.plot(x_test[rand])
+            plt.plot(i[rand])
+            plt.savefig(dirname + "image_part_1_" + str(rand) + ".png")
+            plt.clf()
+            if isnotpamap == 1:
+                plt.subplot(321)
+                i = ensemble[6].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(322)
+                i = ensemble[7].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(323)
+                i = ensemble[8].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(324)
+                i = ensemble[9].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(325)
+                i = ensemble[10].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(326)
+                i = ensemble[11].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+            if isnotpamap == 2:
+                plt.subplot(321)
+                i = ensemble[6].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(322)
+                i = ensemble[7].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(323)
+                i = ensemble[8].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(324)
+                i = ensemble[9].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(325)
+                i = ensemble[10].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+                plt.subplot(326)
+                i = ensemble[11].predict(x_test)
+                plt.plot(x_test[rand])
+                plt.plot(i[rand])
+
+            plt.savefig(dirname + "image_part_2_" + str(rand) + ".png")
+            plt.clf()"""
+
+end = time.time()
+runtime = end - start
+msg = "The runtime for all execution took {time} seconds to complete"
+print(msg.format(time=runtime))
+f.write("total,"+str(runtime))
+
+f.close()
+f2.close()
